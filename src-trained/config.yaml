@@ -1,0 +1,30 @@
+model:
+  path: "saved_models/exp_cnn_se_20260524_185656/model.pth"
+  input_length: 100
+  num_classes: 4
+
+labels:
+  0: "Video"
+  1: "Chat"
+  2: "FileTransfer"
+  3: "Web"
+
+proxy:
+  host: "127.0.0.1"
+  port: 8888
+  max_connections: 100
+  min_packets_for_inference: 10
+
+dashboard:
+  port: 8501
+  refresh_seconds: 2
+  app_order:
+    - "Video"
+    - "Chat"
+    - "FileTransfer"
+    - "Web"
+  color_map:
+    Video: "#FF6B6B"
+    Chat: "#4ECDC4"
+    FileTransfer: "#45B7D1"
+    Web: "#96CEB4"
