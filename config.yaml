@@ -1,5 +1,5 @@
 model:
-  path: "saved_models/exp_cnn_se_20260524_185656/model.pth"
+  path: "model/saved_models/exp_cnn_se_20260524_185656/model.pth"
   input_length: 100
   num_classes: 4
 
@@ -11,7 +11,7 @@ labels:
 
 proxy:
   host: "127.0.0.1"
-  port: 8888
+  port: 8890
   max_connections: 100
   min_packets_for_inference: 3
 

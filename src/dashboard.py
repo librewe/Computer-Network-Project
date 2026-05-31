@@ -2,6 +2,7 @@
 Streamlit dashboard for the traffic proxy demo.
 """
 
+import atexit
 import logging
 import os
 import select
@@ -9,6 +10,7 @@ import socket
 import threading
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -17,6 +19,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import torch
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in os.sys.path:
+    os.sys.path.insert(0, str(PROJECT_ROOT))
 
 from model import create_model, infer_model_type_from_state_dict
 from Proxy import PacketBuffer, TCPProxyServer
@@ -27,6 +34,8 @@ RUNTIME_CONFIG = load_runtime_config()
 LABELS = {int(k): v for k, v in RUNTIME_CONFIG["labels"].items()}
 APP_ORDER = list(RUNTIME_CONFIG["dashboard"]["app_order"])
 COLOR_MAP = dict(RUNTIME_CONFIG["dashboard"]["color_map"])
+REFRESH_SECONDS = int(RUNTIME_CONFIG["dashboard"].get("refresh_seconds", 2))
+ACTIVE_WINDOW_SECONDS = max(REFRESH_SECONDS * 2, 5)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -43,14 +52,16 @@ class DashboardDataManager:
         self.connection_history = []
         self.timeline_data = []
         self.recent_predictions = []
+        self.last_activity_at = None
 
     def update_connection(self, client_addr, app_type, confidence, packet_count):
         with self.lock:
+            now = datetime.now()
             self.total_connections += 1
             self.app_distribution[app_type] += 1
             self.connection_history.append(
                 {
-                    "timestamp": datetime.now(),
+                    "timestamp": now,
                     "client": f"{client_addr[0]}:{client_addr[1]}",
                     "app_type": app_type,
                     "confidence": confidence,
@@ -58,9 +69,12 @@ class DashboardDataManager:
                 }
             )
             self.connection_history = self.connection_history[-self.max_history:]
+            self.last_activity_at = now
 
     def update_traffic(self, bytes_up, bytes_down):
         with self.lock:
+            if bytes_up > 0 or bytes_down > 0:
+                self.last_activity_at = datetime.now()
             self.total_bytes_up += bytes_up
             self.total_bytes_down += bytes_down
 
@@ -77,6 +91,7 @@ class DashboardDataManager:
             self.recent_predictions = self.recent_predictions[-self.max_history:]
             self.timeline_data.append({"timestamp": now, "app_type": app_type})
             self.timeline_data = self.timeline_data[-self.max_history:]
+            self.last_activity_at = now
 
     def get_summary(self) -> Dict:
         with self.lock:
@@ -114,6 +129,12 @@ class DashboardDataManager:
             df = pd.DataFrame(self.connection_history)
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             return df
+
+    def has_recent_activity(self, active_window_seconds):
+        with self.lock:
+            if self.last_activity_at is None:
+                return False
+            return (datetime.now() - self.last_activity_at).total_seconds() <= active_window_seconds
 
 
 class DashboardProxyServer(TCPProxyServer):
@@ -387,6 +408,32 @@ def format_bytes(num_bytes):
     return f"{num_bytes:.2f} TB"
 
 
+def render_status_cards(runtime, data_manager):
+    traffic_detected = data_manager.has_recent_activity(ACTIVE_WINDOW_SECONDS)
+    proxy_text = (
+        f"connected {RUNTIME_CONFIG['proxy']['host']}:{runtime['proxy_port']}"
+        if traffic_detected
+        else f"Please set your network proxy to {RUNTIME_CONFIG['proxy']['host']}:{runtime['proxy_port']}"
+    )
+
+    cols = st.columns(3)
+
+    with cols[0]:
+        if runtime["load_error"]:
+            st.error(f"Model · \n{runtime['load_error']}")
+        else:
+            st.success(f"Model · \n{os.path.basename(runtime['model_path'])}")
+
+    with cols[1]:
+        st.success(f"Service · listening on \n{RUNTIME_CONFIG['proxy']['host']}:{runtime['proxy_port']}") #
+
+    with cols[2]:
+        if traffic_detected:
+            st.success(f"Proxy · \n{proxy_text}")
+        else:
+            st.warning(f"Proxy · \n{proxy_text}")
+
+
 @st.cache_resource(show_spinner=False)
 def get_dashboard_runtime(proxy_port, model_path):
     resolved_model_path = model_path or get_runtime_model_path()
@@ -406,26 +453,33 @@ def get_dashboard_runtime(proxy_port, model_path):
     proxy_thread = threading.Thread(target=proxy_server.start, daemon=True)
     proxy_thread.start()
 
-    logger.info(
-        "Dashboard runtime initialized on %s:%s",
-        RUNTIME_CONFIG["proxy"]["host"],
-        proxy_port,
-    )
+    logger.info("Dashboard runtime initialized on %s:%s", RUNTIME_CONFIG["proxy"]["host"], proxy_port)
     return {
         "data_manager": data_manager,
         "classifier": classifier,
         "load_error": load_error,
         "model_path": resolved_model_path,
         "proxy_port": proxy_port,
+        "proxy_server": proxy_server,
     }
 
 
-def render_dashboard(data_manager, proxy_port):
-    st.set_page_config(page_title="Traffic Monitor Dashboard", page_icon="TD", layout="wide")
-    st.title("Traffic Monitor Dashboard")
-    st.markdown("Encrypted traffic proxy demo with real-time classification statistics.")
+def stop_cached_runtime():
+    runtime = st.session_state.get("dashboard_runtime")
+    if runtime and runtime.get("proxy_server"):
+        runtime["proxy_server"].stop()
 
+
+atexit.register(stop_cached_runtime)
+
+
+@st.fragment(run_every=REFRESH_SECONDS)
+def render_live_dashboard(data_manager, proxy_port):
+    runtime = st.session_state["dashboard_runtime"]
     summary = data_manager.get_summary()
+    render_status_cards(runtime, data_manager)
+    st.markdown("")
+
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Connections", summary["total_connections"])
     col2.metric("Upload", format_bytes(summary["total_bytes_up"]))
@@ -440,12 +494,9 @@ def render_dashboard(data_manager, proxy_port):
         dist = data_manager.get_distribution_data()
         if dist:
             df = pd.DataFrame(
-                [
-                    {"Application": app, "Count": item["count"], "Share": f"{item['percentage']:.1f}%"}
-                    for app, item in dist.items()
-                ]
+                [{"Application": app, "Count": item["count"], "Share": f"{item['percentage']:.1f}%"} for app, item in dist.items()]
             )
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
             fig_pie = px.pie(
                 df,
                 values="Count",
@@ -454,9 +505,9 @@ def render_dashboard(data_manager, proxy_port):
                 color="Application",
                 color_discrete_map=COLOR_MAP,
             )
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width="stretch")
         else:
-            st.info("No traffic has been recorded yet. Generate traffic through the proxy and refresh this page.")
+            st.info("No traffic has been recorded yet. Generate traffic through the proxy and wait for auto-refresh.")
 
     with right:
         st.subheader("Recent Predictions")
@@ -464,9 +515,19 @@ def render_dashboard(data_manager, proxy_port):
         if recent:
             df_recent = pd.DataFrame(recent)
             df_recent["timestamp"] = pd.to_datetime(df_recent["timestamp"]).dt.strftime("%H:%M:%S")
-            st.dataframe(df_recent, use_container_width=True)
+            st.dataframe(df_recent, width="stretch")
         else:
             st.info("No prediction records yet.")
+
+    st.markdown("---")
+    st.subheader("Recent Connections")
+    connection_history_df = data_manager.get_connection_history_df()
+    if not connection_history_df.empty:
+        history_view = connection_history_df.sort_values("timestamp", ascending=False).copy()
+        history_view["timestamp"] = history_view["timestamp"].dt.strftime("%H:%M:%S")
+        st.dataframe(history_view.head(10), width="stretch")
+    else:
+        st.info("No connection records yet.")
 
     st.markdown("---")
     timeline = data_manager.get_timeline_data()
@@ -495,26 +556,24 @@ def render_dashboard(data_manager, proxy_port):
             yaxis_title="Prediction Count",
             hovermode="x unified",
         )
-        st.plotly_chart(fig_line, use_container_width=True)
+        st.plotly_chart(fig_line, width="stretch")
 
     st.caption(
         f"Proxy listening on {RUNTIME_CONFIG['proxy']['host']}:{proxy_port}. "
-        "The page does not auto-refresh yet, so refresh the browser after generating traffic."
+        f"The page auto-refreshes every {REFRESH_SECONDS} seconds."
     )
 
 
+def render_dashboard(data_manager, proxy_port):
+    st.set_page_config(page_title="Traffic Monitor Dashboard", page_icon="TD", layout="wide")
+    st.title("Traffic Monitor Dashboard")
+    st.markdown("Encrypted traffic proxy demo with real-time classification statistics.")
+    render_live_dashboard(data_manager, proxy_port)
+
+
 def run_dashboard(port=8501, proxy_port=8888, model_path=None):
-    st.write("Initializing dashboard...")
     runtime = get_dashboard_runtime(proxy_port, model_path or get_runtime_model_path())
-
-    if runtime["load_error"]:
-        st.error(f"Model load failed: {runtime['load_error']}")
-    else:
-        st.success(f"Model loaded: {runtime['model_path']}")
-
-    st.success(f"Proxy started: {RUNTIME_CONFIG['proxy']['host']}:{proxy_port}")
-    st.info(f"Set your browser proxy to {RUNTIME_CONFIG['proxy']['host']}:{proxy_port}")
-
+    st.session_state["dashboard_runtime"] = runtime
     render_dashboard(runtime["data_manager"], runtime["proxy_port"])
 
 

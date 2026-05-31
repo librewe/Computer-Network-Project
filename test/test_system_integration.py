@@ -7,7 +7,10 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src-trained"
+SRC_DIR = PROJECT_ROOT / "src"
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -23,12 +26,14 @@ class TestProjectStructure(unittest.TestCase):
             "Proxy.py",
             "realtime_inference.py",
             "dashboard.py",
-            "model.py",
             "config.py",
+            "runtime_config.py",
         ]
         for filename in required_files:
             with self.subTest(filename=filename):
                 self.assertTrue((SRC_DIR / filename).exists(), f"Missing file: {filename}")
+        self.assertTrue((PROJECT_ROOT / "model" / "model.py").exists(), "Missing model/model.py")
+        self.assertTrue((PROJECT_ROOT / "config.yaml").exists(), "Missing root config.yaml")
 
     def test_model_weight_exists(self):
         self.assertTrue(TEST_MODEL_PATH.exists(), f"Missing test model: {TEST_MODEL_PATH}")

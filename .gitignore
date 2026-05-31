@@ -1,4 +1,5 @@
 .venv/
+.venv-codex/
 __pycache__/
 *.py[cod]
 *.pyo
@@ -15,14 +16,12 @@ Thumbs.db
 .vscode/
 
 data/
-!src-base/data/
-!src-trained/data/
-
-src-base/__pycache__/
-src-trained/__pycache__/
-
-src-base/saved_models/
-src-trained/saved_models/
+src-base/
+src-trained/
+tmp-logs/
+src/__pycache__/
+model/__pycache__/
+model/saved_models/
 
 *.log
 *.tmp
