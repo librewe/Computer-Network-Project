@@ -26,7 +26,6 @@ class TestProjectStructure(unittest.TestCase):
             "Proxy.py",
             "realtime_inference.py",
             "dashboard.py",
-            "config.py",
             "runtime_config.py",
         ]
         for filename in required_files:
@@ -94,16 +93,19 @@ class TestRealtimeInference(unittest.TestCase):
 class TestDashboardDataFlow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from dashboard import DashboardDataManager
+        import dashboard
+        from dashboard import DashboardDataManager, DashboardProxyServer
 
+        cls.dashboard_module = dashboard
         cls.DashboardDataManager = DashboardDataManager
+        cls.DashboardProxyServer = DashboardProxyServer
 
     def test_data_manager_accumulates_metrics(self):
         manager = self.DashboardDataManager(max_history=10)
 
         manager.update_traffic(1024, 2048)
-        manager.update_connection(("127.0.0.1", 50000), "Video", 0.91, 18)
-        manager.update_prediction("Video", 0.91)
+        manager.update_connection(("127.0.0.1", 50000), "Video", 0.91, 18, domain="example.com")
+        manager.update_prediction("Video", 0.91, domain="example.com")
 
         summary = manager.get_summary()
         dist = manager.get_distribution_data()
@@ -118,6 +120,27 @@ class TestDashboardDataFlow(unittest.TestCase):
         self.assertEqual(dist["Video"]["count"], 1)
         self.assertEqual(len(recent), 1)
         self.assertEqual(len(history_df), 1)
+        self.assertEqual(recent[0]["domain"], "example.com")
+        self.assertEqual(history_df.iloc[0]["domain"], "example.com")
+
+    def test_dashboard_proxy_filters_local_targets(self):
+        manager = self.DashboardDataManager(max_history=10)
+        server = self.DashboardProxyServer(
+            data_manager=manager,
+            listen_host="127.0.0.1",
+            listen_port=18889,
+            max_connections=5,
+            min_packets_for_inference=10,
+        )
+
+        original_flag = self.dashboard_module.RUNTIME_CONFIG["proxy"].get("filter_local_traffic", True)
+        self.dashboard_module.RUNTIME_CONFIG["proxy"]["filter_local_traffic"] = True
+        try:
+            self.assertFalse(server.should_track_host("127.0.0.1"))
+            self.assertFalse(server.should_track_host("localhost"))
+            self.assertTrue(server.should_track_host("example.com"))
+        finally:
+            self.dashboard_module.RUNTIME_CONFIG["proxy"]["filter_local_traffic"] = original_flag
 
 
 if __name__ == "__main__":

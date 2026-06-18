@@ -3,6 +3,7 @@ Streamlit dashboard for the traffic proxy demo.
 """
 
 import atexit
+import ipaddress
 import logging
 import os
 import select
@@ -19,7 +20,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import torch
-
+import errno
+import time
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in os.sys.path:
@@ -54,7 +56,7 @@ class DashboardDataManager:
         self.recent_predictions = []
         self.last_activity_at = None
 
-    def update_connection(self, client_addr, app_type, confidence, packet_count):
+    def update_connection(self, client_addr, app_type, confidence, packet_count, domain=None):
         with self.lock:
             now = datetime.now()
             self.total_connections += 1
@@ -66,6 +68,7 @@ class DashboardDataManager:
                     "app_type": app_type,
                     "confidence": confidence,
                     "packet_count": packet_count,
+                    "domain": domain or "-",
                 }
             )
             self.connection_history = self.connection_history[-self.max_history:]
@@ -78,7 +81,7 @@ class DashboardDataManager:
             self.total_bytes_up += bytes_up
             self.total_bytes_down += bytes_down
 
-    def update_prediction(self, app_type, confidence):
+    def update_prediction(self, app_type, confidence, domain=None):
         with self.lock:
             now = datetime.now()
             self.recent_predictions.append(
@@ -86,10 +89,11 @@ class DashboardDataManager:
                     "timestamp": now,
                     "app_type": app_type,
                     "confidence": confidence,
+                    "domain": domain or "-",
                 }
             )
             self.recent_predictions = self.recent_predictions[-self.max_history:]
-            self.timeline_data.append({"timestamp": now, "app_type": app_type})
+            self.timeline_data.append({"timestamp": now, "app_type": app_type, "domain": domain or "-"})
             self.timeline_data = self.timeline_data[-self.max_history:]
             self.last_activity_at = now
 
@@ -120,7 +124,7 @@ class DashboardDataManager:
 
     def get_recent_predictions(self) -> List[Dict]:
         with self.lock:
-            return list(self.recent_predictions[-20:])
+            return list(self.recent_predictions[-30:])
 
     def get_connection_history_df(self):
         with self.lock:
@@ -156,44 +160,123 @@ class DashboardProxyServer(TCPProxyServer):
         self.min_packets_for_inference = min_packets_for_inference
         self.classifier = None
         self.reported_buffers = set()
+        self._local_addresses = self._collect_local_addresses()
 
     def set_classifier(self, classifier):
         self.classifier = classifier
 
-    def try_infer(self, buffer_id, packet_buffer, client_addr, force=False):
+    def _collect_local_addresses(self):
+        local_addresses = {"127.0.0.1", "::1", "localhost", self.listen_host}
+
+        try:
+            hostname = socket.gethostname()
+            local_addresses.update(socket.gethostbyname_ex(hostname)[2])
+        except socket.gaierror:
+            pass
+
+        return {addr.lower() for addr in local_addresses if addr}
+
+    def should_track_host(self, host):
+        if not host:
+            return True
+        if not bool(RUNTIME_CONFIG["proxy"].get("filter_local_traffic", True)):
+            return True
+
+        normalized_host = host.strip().lower()
+        if normalized_host in self._local_addresses:
+            return False
+
+        try:
+            ip = ipaddress.ip_address(normalized_host)
+            return not (ip.is_loopback or ip.is_unspecified)
+        except ValueError:
+            pass
+
+        try:
+            resolved_addresses = socket.gethostbyname_ex(host)[2]
+        except socket.gaierror:
+            return True
+
+        for address in resolved_addresses:
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if ip.is_loopback or address.lower() in self._local_addresses:
+                return False
+
+        return True
+
+    def try_infer(self, buffer_id, packet_buffer, client_addr, domain=None, track_connection=True, force=False):
         packet_count = len(packet_buffer.packet_lengths)
         if buffer_id in self.reported_buffers:
             return
         if packet_count == 0:
+            return
+        if not track_connection:
             return
         if not force and packet_count < self.min_packets_for_inference:
             return
         if not self.classifier or buffer_id not in self.packet_buffers:
             return
 
-        result = self.classifier.classify(packet_buffer.get_normalized_features())
-        self.data_manager.update_connection(
-            client_addr,
-            result["class_name"],
-            result["confidence"],
-            packet_count,
-        )
-        self.data_manager.update_prediction(result["class_name"], result["confidence"])
-        self.reported_buffers.add(buffer_id)
-        logger.info(
-            "Dashboard classified %s:%s as %s (confidence=%.2f, packets=%s)",
-            client_addr[0],
-            client_addr[1],
-            result["class_name"],
-            result["confidence"],
-            packet_count,
-        )
+        def do_infer():
+            try:
+                result = self.classifier.classify(packet_buffer.get_normalized_features())
+                self.data_manager.update_connection(
+                    client_addr,
+                    result["class_name"],
+                    result["confidence"],
+                    packet_count,
+                    domain=domain,
+                )
+                self.data_manager.update_prediction(result["class_name"], result["confidence"], domain=domain)
+                logger.info("Dashboard classified %s:%s as %s (confidence=%.2f, packets=%s)",
+                    client_addr[0], client_addr[1], result["class_name"], result["confidence"], packet_count)
+            except Exception as e:
+                logger.error("Inference error: %s", e)
 
+        threading.Thread(target=do_infer, daemon=True).start()
+        self.reported_buffers.add(buffer_id)
+        
+    def _sendall_nonblocking(self, sock, data, timeout=30.0):
+        """在非阻塞 socket 上安全发送全部数据"""
+        sent = 0
+        total_len = len(data)
+        start_time = time.time()
+        
+        while sent < total_len:
+            # 检查总体超时
+            if time.time() - start_time > timeout:
+                raise socket.timeout("Overall send timeout")
+                
+            try:
+                n = sock.send(data[sent:])
+                if n == 0:
+                    # 连接可能已关闭
+                    raise ConnectionError("Socket connection closed by peer")
+                sent += n
+            except (BlockingIOError, OSError) as e:
+                if isinstance(e, OSError) and e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                # 等待 socket 可写，使用更长的超时
+                remaining = timeout - (time.time() - start_time)
+                if remaining <= 0:
+                    raise socket.timeout("Send timeout")
+                ready, _, _ = select.select([], [sock], [], min(remaining, 5.0))
+                if not ready:
+                    continue  # 继续尝试，而不是立即抛出超时
+            except socket.error:
+                raise
+        return sent
     def handle_client(self, client_socket, client_addr):
         buffer_id = f"{client_addr[0]}:{client_addr[1]}:{datetime.now().timestamp()}"
         packet_buffer = PacketBuffer()
         self.packet_buffers[buffer_id] = packet_buffer
         remote_socket = None
+        track_connection = True
+        target_domain = None
+        self.register_connection(buffer_id, client_socket)
 
         try:
             client_socket.setblocking(False)
@@ -208,7 +291,7 @@ class DashboardProxyServer(TCPProxyServer):
                 except socket.error:
                     if not data:
                         try:
-                            ready, _, _ = select.select([client_socket], [], [], 0.1)
+                            ready, _, _ = select.select([client_socket], [], [], 4)
                             if not ready:
                                 break
                         except Exception:
@@ -220,49 +303,70 @@ class DashboardProxyServer(TCPProxyServer):
                     if self.is_http_connect(data):
                         self.handle_http_connect_dashboard(client_socket, data, client_addr)
                         return
+                    host, _ = self.parse_host_from_request(data)
+                    target_domain = host
+                    track_connection = self.should_track_host(host)
                     remote_socket = self.establish_remote_connection(data, client_addr)
                     if remote_socket is None:
                         self.send_error_response(client_socket, 502)
                         return
+                    remote_socket.setblocking(False)
+                    self.register_connection(buffer_id, remote_socket)
 
                 if remote_socket and data:
-                    remote_socket.sendall(data)
+                    self._sendall_nonblocking(remote_socket,data)
                     packet_buffer.add_packet(len(data), "up")
                     with self.stats_lock:
                         self.stats["total_bytes_up"] += len(data)
-                    self.data_manager.update_traffic(len(data), 0)
-                    self.try_infer(buffer_id, packet_buffer, client_addr)
+                    if track_connection:
+                        self.data_manager.update_traffic(len(data), 0)
+                    self.try_infer(
+                        buffer_id,
+                        packet_buffer,
+                        client_addr,
+                        domain=target_domain,
+                        track_connection=track_connection,
+                    )
                     data = b""
 
                 if remote_socket:
                     try:
-                        ready, _, _ = select.select([remote_socket], [], [], 0.1)
+                        ready, _, _ = select.select([remote_socket], [], [], 4)
                         if ready:
                             response = remote_socket.recv(8192)
                             if response:
-                                client_socket.sendall(response)
+                                # client_socket.sendall(response)
+                                self._sendall_nonblocking(client_socket, response)
                                 packet_buffer.add_packet(len(response), "down")
                                 with self.stats_lock:
                                     self.stats["total_bytes_down"] += len(response)
-                                self.data_manager.update_traffic(0, len(response))
-                                self.try_infer(buffer_id, packet_buffer, client_addr)
+                                if track_connection:
+                                    self.data_manager.update_traffic(0, len(response))
+                                self.try_infer(
+                                    buffer_id,
+                                    packet_buffer,
+                                    client_addr,
+                                    domain=target_domain,
+                                    track_connection=track_connection,
+                                )
                             else:
                                 break
                     except socket.error:
                         break
         finally:
-            self.try_infer(buffer_id, packet_buffer, client_addr, force=True)
-            if remote_socket:
-                try:
-                    remote_socket.close()
-                except Exception:
-                    pass
-            try:
-                client_socket.close()
-            except Exception:
-                pass
+            self.try_infer(
+                buffer_id,
+                packet_buffer,
+                client_addr,
+                domain=target_domain,
+                track_connection=track_connection,
+                force=True,
+            )
+            self.close_socket_safely(remote_socket)
+            self.close_socket_safely(client_socket)
             self.packet_buffers.pop(buffer_id, None)
             self.reported_buffers.discard(buffer_id)
+            self.unregister_connection(buffer_id)
 
     def handle_http_connect_dashboard(self, client_socket, data, client_addr):
         remote_socket = None
@@ -284,6 +388,8 @@ class DashboardProxyServer(TCPProxyServer):
                 host = host_port
                 port = 443
 
+            track_connection = self.should_track_host(host)
+
             logger.info("HTTP CONNECT: %s:%s", host, port)
 
             remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -297,22 +403,33 @@ class DashboardProxyServer(TCPProxyServer):
             buffer_id = f"{client_addr[0]}:{client_addr[1]}:{datetime.now().timestamp()}"
             packet_buffer = PacketBuffer()
             self.packet_buffers[buffer_id] = packet_buffer
-            self.tunnel_data_dashboard(client_socket, remote_socket, buffer_id, packet_buffer, client_addr)
+            self.register_connection(buffer_id, client_socket, remote_socket)
+            self.tunnel_data_dashboard(
+                client_socket,
+                remote_socket,
+                buffer_id,
+                packet_buffer,
+                client_addr,
+                host,
+                track_connection,
+            )
         except Exception as exc:
             self.send_error_response(client_socket, 502)
             logger.error("HTTP CONNECT dashboard error: %s", exc)
         finally:
-            if remote_socket:
-                try:
-                    remote_socket.close()
-                except Exception:
-                    pass
-            try:
-                client_socket.close()
-            except Exception:
-                pass
+            self.close_socket_safely(remote_socket)
+            self.close_socket_safely(client_socket)
 
-    def tunnel_data_dashboard(self, client_socket, remote_socket, buffer_id, packet_buffer, client_addr):
+    def tunnel_data_dashboard(
+        self,
+        client_socket,
+        remote_socket,
+        buffer_id,
+        packet_buffer,
+        client_addr,
+        domain,
+        track_connection,
+    ):
         sockets = [client_socket, remote_socket]
 
         try:
@@ -326,33 +443,45 @@ class DashboardProxyServer(TCPProxyServer):
                             return
 
                         if sock is client_socket:
-                            remote_socket.sendall(data)
+                            # remote_socket.sendall(data)
+                            self._sendall_nonblocking(remote_socket, data)
                             packet_buffer.add_packet(len(data), "up")
                             with self.stats_lock:
                                 self.stats["total_bytes_up"] += len(data)
-                            self.data_manager.update_traffic(len(data), 0)
+                            if track_connection:
+                                self.data_manager.update_traffic(len(data), 0)
                         else:
-                            client_socket.sendall(data)
+                            # client_socket.sendall(data)
+                            self._sendall_nonblocking(client_socket, data)
                             packet_buffer.add_packet(len(data), "down")
                             with self.stats_lock:
                                 self.stats["total_bytes_down"] += len(data)
-                            self.data_manager.update_traffic(0, len(data))
+                            if track_connection:
+                                self.data_manager.update_traffic(0, len(data))
 
-                        self.try_infer(buffer_id, packet_buffer, client_addr)
+                        self.try_infer(
+                            buffer_id,
+                            packet_buffer,
+                            client_addr,
+                            domain=domain,
+                            track_connection=track_connection,
+                        )
                     except socket.error:
                         return
         finally:
-            self.try_infer(buffer_id, packet_buffer, client_addr, force=True)
-            try:
-                client_socket.close()
-            except Exception:
-                pass
-            try:
-                remote_socket.close()
-            except Exception:
-                pass
+            self.try_infer(
+                buffer_id,
+                packet_buffer,
+                client_addr,
+                domain=domain,
+                track_connection=track_connection,
+                force=True,
+            )
+            self.close_socket_safely(client_socket)
+            self.close_socket_safely(remote_socket)
             self.packet_buffers.pop(buffer_id, None)
             self.reported_buffers.discard(buffer_id)
+            self.unregister_connection(buffer_id)
 
 
 class SimpleClassifier:
@@ -515,6 +644,7 @@ def render_live_dashboard(data_manager, proxy_port):
         if recent:
             df_recent = pd.DataFrame(recent)
             df_recent["timestamp"] = pd.to_datetime(df_recent["timestamp"]).dt.strftime("%H:%M:%S")
+            df_recent["confidence"] = df_recent["confidence"].map(lambda value: f"{value:.4f}")
             st.dataframe(df_recent, width="stretch")
         else:
             st.info("No prediction records yet.")
@@ -525,7 +655,8 @@ def render_live_dashboard(data_manager, proxy_port):
     if not connection_history_df.empty:
         history_view = connection_history_df.sort_values("timestamp", ascending=False).copy()
         history_view["timestamp"] = history_view["timestamp"].dt.strftime("%H:%M:%S")
-        st.dataframe(history_view.head(10), width="stretch")
+        history_view["confidence"] = history_view["confidence"].map(lambda value: f"{value:.4f}")
+        st.dataframe(history_view.head(20), width="stretch")
     else:
         st.info("No connection records yet.")
 

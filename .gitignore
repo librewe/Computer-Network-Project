@@ -21,7 +21,7 @@ src-trained/
 tmp-logs/
 src/__pycache__/
 model/__pycache__/
-model/saved_models/
+# model/saved_models/
 
 *.log
 *.tmp

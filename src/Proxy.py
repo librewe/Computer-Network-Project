@@ -75,6 +75,29 @@ class TCPProxyServer:
         }
         self.stats_lock = threading.Lock()
 
+    def register_connection(self, connection_id, *sockets):
+        with self.connection_lock:
+            tracked = self.active_connections.setdefault(connection_id, set())
+            for sock in sockets:
+                if sock is not None:
+                    tracked.add(sock)
+
+    def unregister_connection(self, connection_id):
+        with self.connection_lock:
+            self.active_connections.pop(connection_id, None)
+
+    def close_socket_safely(self, sock):
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+
     def start(self):
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -122,6 +145,7 @@ class TCPProxyServer:
         packet_buffer = PacketBuffer()
         self.packet_buffers[buffer_id] = packet_buffer
         remote_socket = None
+        self.register_connection(buffer_id, client_socket)
 
         try:
             client_socket.setblocking(False)
@@ -152,6 +176,7 @@ class TCPProxyServer:
                     if remote_socket is None:
                         self.send_error_response(client_socket, 502)
                         return
+                    self.register_connection(buffer_id, remote_socket)
 
                 if remote_socket and data:
                     remote_socket.sendall(data)
@@ -185,16 +210,10 @@ class TCPProxyServer:
         except Exception as exc:
             logger.error("处理客户端 %s 错误: %s", client_addr, exc)
         finally:
-            if remote_socket:
-                try:
-                    remote_socket.close()
-                except Exception:
-                    pass
-            try:
-                client_socket.close()
-            except Exception:
-                pass
+            self.close_socket_safely(remote_socket)
+            self.close_socket_safely(client_socket)
             self.packet_buffers.pop(buffer_id, None)
+            self.unregister_connection(buffer_id)
 
     def is_http_connect(self, data):
         try:
@@ -235,15 +254,13 @@ class TCPProxyServer:
             buffer_id = f"{client_addr[0]}:{client_addr[1]}:{time.time()}"
             packet_buffer = PacketBuffer()
             self.packet_buffers[buffer_id] = packet_buffer
+            self.register_connection(buffer_id, client_socket, remote_socket)
 
             self.tunnel_data(client_socket, remote_socket, buffer_id, packet_buffer)
         except Exception as exc:
             logger.error("HTTP CONNECT处理错误: %s", exc)
         finally:
-            try:
-                client_socket.close()
-            except Exception:
-                pass
+            self.close_socket_safely(client_socket)
 
     def tunnel_data(self, client_socket, remote_socket, buffer_id, packet_buffer):
         sockets = [client_socket, remote_socket]
@@ -277,15 +294,10 @@ class TCPProxyServer:
         except Exception as exc:
             logger.error("隧道传输错误: %s", exc)
         finally:
-            try:
-                client_socket.close()
-            except Exception:
-                pass
-            try:
-                remote_socket.close()
-            except Exception:
-                pass
+            self.close_socket_safely(client_socket)
+            self.close_socket_safely(remote_socket)
             self.packet_buffers.pop(buffer_id, None)
+            self.unregister_connection(buffer_id)
 
     def establish_remote_connection(self, data, client_addr):
         try:
@@ -343,18 +355,15 @@ class TCPProxyServer:
         logger.info("正在停止代理服务器...")
         self.running = False
         if self.server_socket:
-            try:
-                self.server_socket.close()
-            except Exception:
-                pass
+            self.close_socket_safely(self.server_socket)
             self.server_socket = None
         with self.connection_lock:
-            for conn in list(self.active_connections.values()):
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            active_sockets = []
+            for sockets in self.active_connections.values():
+                active_sockets.extend(list(sockets))
             self.active_connections.clear()
+        for sock in active_sockets:
+            self.close_socket_safely(sock)
         logger.info("代理服务器已停止")
 
 

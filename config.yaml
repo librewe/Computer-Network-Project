@@ -13,7 +13,8 @@ proxy:
   host: "127.0.0.1"
   port: 8890
   max_connections: 100
-  min_packets_for_inference: 3
+  min_packets_for_inference: 10
+  filter_local_traffic: false
 
 dashboard:
   port: 8501
